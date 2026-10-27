@@ -1,7 +1,8 @@
-TotalReclaw Hermes plugin installed (rc.10+ self-bootstraps).
+TotalReclaw Hermes plugin installed (it installs the totalreclaw package on first load).
 
 Next steps:
-  1. Restart the gateway: hermes gateway restart
+  1. Enable it (Hermes 0.22+): hermes plugins enable totalreclaw
+     Then restart the gateway: hermes gateway restart
   2. Ask your agent: "Set up TotalReclaw"
   3. The agent gives you a URL + 6-digit PIN to open in your browser.
 

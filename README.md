@@ -7,24 +7,32 @@ crosses the LLM context.
 ## Install
 
 ```bash
-hermes plugins install p-diogo/totalreclaw-hermes
+hermes plugins install graphprotocol/totalreclaw-hermes
 ```
 
 ## Post-install
 
-rc.10+ self-bootstraps on first `hermes gateway restart`. The plugin installs
-the `totalreclaw` Python package into the Hermes venv (bypassing user-site
-if `ENABLE_USER_SITE=False`), bootstraps pip via `ensurepip` if the venv was
-created `--without-pip`, and verifies `~/.totalreclaw/` is writable by the
-Hermes runtime user. No manual `pip install` is required.
+The plugin installs the `totalreclaw` Python package itself on first load. It
+installs into the environment Hermes actually imports from (on Hermes 0.22+
+that is Hermes' managed venv, not the Python that runs Hermes), with all of
+its dependencies, and only ever the newest stable release. It bootstraps pip
+via `ensurepip` when that environment has none, and checks that
+`~/.totalreclaw/` is writable by the Hermes runtime user. No manual
+`pip install` is required.
+
+On Hermes 0.22+ plugins are opt-in, so enable it, then restart:
 
 ```bash
+hermes plugins enable totalreclaw
 hermes gateway restart
 ```
 
-Any bootstrap failure surfaces as a `RuntimeError` with actionable guidance
-(e.g. if `~/.totalreclaw/` is root-owned under a Docker volume mount, the
-error includes the exact `chown` command to run from the host).
+If the package still can't be loaded after the install attempt, the plugin
+loads in a degraded mode instead of failing silently: the agent is told that
+memory is offline and says so, and `totalreclaw_status` reports the exact
+error and the command that fixes it. A `~/.totalreclaw/` that is root-owned
+under a Docker volume mount raises an error with the exact `chown` command to
+run from the host.
 
 ## Setup
 

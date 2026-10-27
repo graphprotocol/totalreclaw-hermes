@@ -1,6 +1,6 @@
-"""Hermes Git plugin for TotalReclaw — rc.10 auto-bootstrap edition.
+"""Hermes Git plugin for TotalReclaw.
 
-Installable via ``hermes plugins install p-diogo/totalreclaw-hermes``.
+Installable via ``hermes plugins install graphprotocol/totalreclaw-hermes``.
 
 The heavy lifting — tool handlers, pair-server crypto, HTTP pairing
 server, agent hooks — lives in the ``totalreclaw`` Python package on
@@ -8,17 +8,21 @@ PyPI. This Git plugin is a thin wrapper that makes TotalReclaw
 discoverable to Hermes via its Git-plugin system (``plugin.yaml`` +
 ``__init__.py`` at repo root).
 
-rc.10 self-heals three friction points observed on Docker Hermes:
+On load it makes sure the ``totalreclaw`` package is importable:
 
-1. ``pip install totalreclaw`` landing in user-site when Hermes venv has
-   ``ENABLE_USER_SITE=False`` (import fails silently despite pip success).
-2. Hermes venv missing pip entirely (e.g. ``uv venv``, ``virtualenv --without-pip``).
-3. ``~/.totalreclaw/`` owned by root under a Docker volume mount while
-   Hermes runs as a non-root uid, so the first lock-file create fails.
+1. It installs into the environment this process actually imports from.
+   Hermes 0.22+ runs on its own Python but imports its dependencies from
+   a separate managed venv, so ``sys.executable`` alone is the wrong
+   target. Dependencies are installed too.
+2. It installs the newest stable release only, never a pre-release.
+3. It verifies the import afterwards. If the package still can't be
+   loaded, the plugin loads in a degraded mode: a ``totalreclaw_status``
+   tool reports the problem and the fix, and the agent is told on the
+   first turn that memory is offline, so the user hears about it.
 
-All bootstrap paths raise ``RuntimeError`` with actionable guidance rather
-than failing silently. Each step is idempotent — re-running the bootstrap
-on a healthy install is a no-op.
+It also checks that ``~/.totalreclaw/`` is writable (Docker volume mounts
+created by root) and mirrors the package's SKILL.md into the Hermes skills
+directory. Each step is idempotent.
 
 See:
 - https://github.com/graphprotocol/totalreclaw
@@ -26,89 +30,147 @@ See:
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+_PIP_TIMEOUT_S = 900
+# Set when the package could not be made importable; register() then
+# degrades instead of failing the whole plugin load.
+_LOAD_ERROR: Optional[str] = None
+_FIX_COMMAND: Optional[str] = None
 
-def _ensure_pip_in_venv() -> None:
-    """If running inside a venv that lacks pip (common on ``uv venv`` or
-    ``virtualenv --without-pip``), bootstrap pip via ensurepip before any
-    install attempt."""
-    try:
-        import pip  # noqa: F401
-        return
-    except ImportError:
-        pass
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "ensurepip", "--upgrade"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            "Hermes venv lacks pip AND ensurepip failed. "
-            "Run `python -m ensurepip` manually inside your venv, "
-            "then restart the Hermes gateway."
-        ) from exc
+_DEGRADED_STATUS_SCHEMA = {
+    "name": "totalreclaw_status",
+    "description": (
+        "Check TotalReclaw billing status, usage, and tier information. "
+        "DEGRADED: the totalreclaw Python package could not be loaded, so "
+        "only this diagnostic tool is available."
+    ),
+    "parameters": {"type": "object", "properties": {}},
+}
+
+_DEGRADED_NOTICE = (
+    "TotalReclaw memory is OFFLINE on this Hermes install: the totalreclaw "
+    "package could not be loaded, so nothing is being remembered or "
+    "recalled. Tell the user this in your reply, in one sentence, and "
+    "offer to show the fix (call totalreclaw_status for the exact command)."
+)
 
 
-def _install_totalreclaw_in_venv() -> None:
-    """Ensure the ``totalreclaw`` Python package is importable by the
-    CURRENT Python interpreter. If a prior ``pip install`` landed in
-    user-site (because the Hermes venv has ``ENABLE_USER_SITE=False``)
-    or never ran at all, install it now using the venv's own pip so it
-    lands in venv site-packages."""
+def _target_python() -> str:
+    """Interpreter of the environment this process imports packages from.
+
+    The first site-packages entry on ``sys.path`` is the one in use. When it
+    belongs to a venv (Hermes 0.22+'s managed venv, or a classic Hermes
+    venv), target that venv's interpreter; otherwise the running one.
+    """
+    for entry in sys.path:
+        sp = Path(entry)
+        if sp.name not in ("site-packages", "dist-packages") or not sp.is_dir():
+            continue
+        for root in (sp.parent.parent.parent, sp.parent.parent):
+            if (root / "pyvenv.cfg").is_file():
+                if root.resolve() == Path(sys.prefix).resolve():
+                    return sys.executable
+                for exe in (root / "bin" / "python3", root / "bin" / "python",
+                            root / "Scripts" / "python.exe"):
+                    if exe.exists():
+                        return str(exe)
+        break
+    return sys.executable
+
+
+def _clean_env() -> dict:
+    env = dict(os.environ)
+    # PYTHONPATH would make pip treat packages from other environments as
+    # installed and skip them. The PIP_* overrides could add --pre,
+    # --no-deps or a --user/--target install.
+    for key in ("PYTHONPATH", "PYTHONHOME", "PIP_PRE", "PIP_NO_DEPS",
+                "PIP_USER", "PIP_TARGET", "PIP_PREFIX"):
+        env.pop(key, None)
+    return env
+
+
+def _has_pip(python: str, env: dict) -> bool:
     try:
-        import totalreclaw  # noqa: F401
-        return
-    except ImportError:
-        pass
-    _ensure_pip_in_venv()
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--pre",
-        "--no-cache-dir",
-        "--index-url",
-        "https://pypi.org/simple/",
-        "--no-warn-script-location",
-        "totalreclaw",
-        # `--pre` applies to every dependency, not just totalreclaw. In a venv
-        # without httpx it resolves the httpx 1.0 pre-release, which drops
-        # `httpx.HTTPStatusError` and makes `import totalreclaw` (<= 2.5.2)
-        # fail. totalreclaw >= 2.5.3 caps httpx itself; this covers older pins.
-        "httpx<1",
+        return subprocess.run(
+            [python, "-m", "pip", "--version"], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _pip_install_totalreclaw() -> Optional[str]:
+    """Install the newest stable ``totalreclaw`` with its dependencies into
+    the environment this process imports from. Returns ``None`` on success,
+    an error string on failure. Never raises."""
+    global _FIX_COMMAND
+    env = _clean_env()
+    target = _target_python()
+    tail = [
+        "install", "--disable-pip-version-check", "--no-warn-script-location",
+        "--index-url", "https://pypi.org/simple/", "totalreclaw",
     ]
-    # 2026-05-28: capture stderr instead of dropping to DEVNULL. CI's
-    # bootstrap-venv-without-pip job has been failing with no diagnostic
-    # info — the underlying pip error needs to reach the operator. Still
-    # check_call (raises CalledProcessError on non-zero), but stderr is
-    # captured + re-raised in the RuntimeError message.
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        # Trim very long pip outputs to keep the error message readable.
-        stderr_tail = (proc.stderr or "").strip()[-2000:]
-        stdout_tail = (proc.stdout or "").strip()[-500:]
-        raise RuntimeError(
-            f"pip install totalreclaw failed (exit {proc.returncode}). "
-            f"Command: {' '.join(cmd)}\n"
-            f"stderr (last 2KB):\n{stderr_tail}\n"
-            f"stdout (last 500B):\n{stdout_tail}"
+    if target == sys.executable:
+        cmd = [sys.executable, "-m", "pip", *tail]
+    else:
+        cmd = [sys.executable, "-m", "pip", "--python", target, *tail]
+    _FIX_COMMAND = " ".join(cmd)
+    try:
+        if not _has_pip(sys.executable, env):
+            # e.g. a venv created with ``uv venv`` / ``--without-pip``.
+            if not _has_pip(target, env):
+                subprocess.run(
+                    [target, "-m", "ensurepip", "--upgrade"], env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=300, check=True,
+                )
+            cmd = [target, "-m", "pip", *tail]
+            _FIX_COMMAND = " ".join(cmd)
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False, env=env, timeout=_PIP_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired:
+        return f"`{_FIX_COMMAND}` did not finish within {_PIP_TIMEOUT_S}s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not run pip: {exc}"
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-2000:]
+        return f"`{_FIX_COMMAND}` exited {proc.returncode}. stderr tail:\n{stderr_tail}"
+    return None
+
+
+def _install_totalreclaw_in_venv() -> Optional[str]:
+    """Make ``totalreclaw`` importable by this process. Returns ``None`` when
+    it is, else a description of what failed."""
+    try:
+        import totalreclaw.hermes  # noqa: F401
+        return None
+    except ImportError as exc:
+        first_err = exc
+    heal_err = _pip_install_totalreclaw()
+    if heal_err is not None:
+        return f"`import totalreclaw` failed ({first_err}) and the install failed: {heal_err}"
+    importlib.invalidate_caches()
+    try:
+        import totalreclaw.hermes  # noqa: F401,F811
+    except ImportError as exc:
+        return (
+            f"the install ran (`{_FIX_COMMAND}`) but `import totalreclaw` "
+            f"still fails: {exc}"
+        )
+    logger.warning("TotalReclaw: installed the totalreclaw package (%s)", _FIX_COMMAND)
+    return None
 
 
 def _ensure_state_dir_writable() -> None:
@@ -224,15 +286,60 @@ def _install_skill() -> None:
 
 
 def _bootstrap() -> None:
-    _install_totalreclaw_in_venv()
+    global _LOAD_ERROR
+    _LOAD_ERROR = _install_totalreclaw_in_venv()
+    if _LOAD_ERROR is not None:
+        logger.error(
+            "TotalReclaw loaded DEGRADED — the totalreclaw package could not be "
+            "loaded. Only a diagnostic totalreclaw_status tool will be "
+            "registered. %s", _LOAD_ERROR,
+        )
+        return
     _ensure_state_dir_writable()
     _install_skill()
 
 
 _bootstrap()
 
-# After bootstrap, the real register() is importable.
-from totalreclaw.hermes import register as _register  # noqa: E402
+
+def _register_degraded(ctx) -> None:
+    """Make a failed bootstrap visible: a status tool that names the problem
+    and the fix, plus a first-turn notice so the agent tells the user."""
+
+    def _degraded_status(args, **kw):
+        return {
+            "ok": False,
+            "degraded": True,
+            "error": (
+                "The totalreclaw Python package could not be loaded in this "
+                "Hermes install. Memory tools are unavailable until it is "
+                "reinstalled."
+            ),
+            "fix": (
+                "Run: " + (_FIX_COMMAND or (sys.executable + " -m pip install totalreclaw"))
+                + "   then restart the Hermes gateway."
+            ),
+            "detail": _LOAD_ERROR,
+        }
+
+    def _degraded_notice(**kw):
+        if kw.get("is_first_turn", True):
+            return {"context": _DEGRADED_NOTICE}
+        return None
+
+    try:
+        ctx.register_tool(
+            name="totalreclaw_status",
+            toolset="totalreclaw",
+            schema=_DEGRADED_STATUS_SCHEMA,
+            handler=_degraded_status,
+        )
+    except Exception:
+        logger.exception("TotalReclaw: degraded status tool registration failed")
+    try:
+        ctx.register_hook("pre_llm_call", _degraded_notice)
+    except Exception:
+        logger.exception("TotalReclaw: degraded notice hook registration failed")
 
 
 def register(ctx):
@@ -248,5 +355,9 @@ def register(ctx):
     when the installed ``totalreclaw`` wheel is a pre-release (PEP-440
     ``rcN`` or SemVer ``-rc.N``) build.
     """
+    if _LOAD_ERROR is not None:
+        return _register_degraded(ctx)
+    from totalreclaw.hermes import register as _register
+
     logger.info("totalreclaw Git plugin loading — delegating to totalreclaw.hermes.register")
     return _register(ctx)
