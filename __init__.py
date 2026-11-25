@@ -24,6 +24,11 @@ It also checks that ``~/.totalreclaw/`` is writable (Docker volume mounts
 created by root) and mirrors the package's SKILL.md into the Hermes skills
 directory. Each step is idempotent.
 
+The module also re-exports ``TotalReclawMemoryProvider`` (a Hermes
+``MemoryProvider``) so that Hermes' memory-provider discovery, which scans
+this file's first 8 KB for the ``MemoryProvider`` contract, finds it here and
+nothing has to overwrite this file with a generated sidecar.
+
 See:
 - https://github.com/graphprotocol/totalreclaw
 - https://github.com/graphprotocol/totalreclaw/blob/main/docs/guides/hermes-setup.md
@@ -300,6 +305,20 @@ def _bootstrap() -> None:
 
 
 _bootstrap()
+
+# Hermes discovers memory providers by scanning ``plugins/<name>/`` for
+# ``MemoryProvider`` subclasses. Re-export the package's provider here so
+# that, with ``memory.provider: totalreclaw`` set in config, Hermes finds it
+# in THIS file. Nothing then needs to overwrite this git-tracked file with
+# the package's generated sidecar (``totalreclaw activate-memory-provider
+# --force``), which leaves the plugin checkout dirty and clashes with
+# ``hermes plugins update``. Absent when the package could not be loaded.
+TotalReclawMemoryProvider = None
+if _LOAD_ERROR is None:
+    try:
+        from totalreclaw.hermes.memory_provider import TotalReclawMemoryProvider  # noqa: F401
+    except ImportError:
+        TotalReclawMemoryProvider = None
 
 
 def _register_degraded(ctx) -> None:
